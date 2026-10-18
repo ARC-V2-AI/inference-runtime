@@ -1,0 +1,48 @@
+[project]
+name = "arc-v2-inference-runtime"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [{ name = "PauWol", email = "paul22wof@proton.me" }]
+requires-python = ">=3.11"
+dependencies = [
+    "arc-v2-service-runner",
+    "arc-v2-util",
+    "fastapi>=0.142.2",
+    "gguf>=0.19.0",
+    "jinja2>=3.1.6",
+    "llama-cpp-python",
+    "pydantic>=2.13.5",
+    "uvicorn>=0.54.0",
+]
+
+[project.scripts]
+arc-v2-inference-runtime = "arc_v2_inference_runtime:main"
+
+[build-system]
+requires = ["uv_build>=0.12.23,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+arc-v2-service-runner = { git = "https://github.com/ARC-V2-AI/service-runner.git" }
+arc-v2-util = { git = "https://github.com/ARC-V2-AI/ARC-V2-Util.git" }
+llama-cpp-python = { index = "llama-cpp-python-cu132" }
+
+[[tool.uv.index]]
+name = "llama-cpp-python-cu132"
+url = "https://abetlen.github.io/llama-cpp-python/whl/cu132"
+explicit = true
+
+[tool.basedpyright]
+reportAny = false
+reportExplicitAny = false
+
+
+[tool.arc.service]
+id = "inference-runtime"
+module = "arc_v2_inference_runtime.service"
+name = "ARC Inference Runtime Server"
+description = "Inference server backend for ARC"
+restart = "on-failure"
+health = "restart"
+depends = []
