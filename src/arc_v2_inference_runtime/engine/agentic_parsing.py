@@ -15,6 +15,7 @@ handler while allowing ARC to use the model's native chat template/protocol.
 from __future__ import annotations
 
 import json
+import math
 import re
 import uuid
 from dataclasses import dataclass
@@ -37,10 +38,6 @@ _Mode = Literal[
 ]
 
 
-_FUNCTION_OPEN_RE = re.compile(r"<function=([^>]+)>")
-_PARAM_OPEN_RE = re.compile(r"<parameter=([^>]+)>")
-_FUNCTION_CLOSE = "</function>"
-_PARAM_CLOSE = "</parameter>"
 _NAME_RE = re.compile(r'"name"\s*:\s*"((?:[^"\\]|\\.)*)"')
 _ARGS_KEY_RE = re.compile(r'"(?:arguments|parameters)"\s*:\s*')
 
@@ -59,15 +56,17 @@ def _new_call_id() -> str:
     return f"call-{uuid.uuid4().hex}"
 
 
-def _trim_param_value(raw: str) -> str:
-    # Native Qwen function-parameter templates add one framing newline.
-    raw = raw.removeprefix("\n")
-    raw = raw.removesuffix("\n")
-    return raw
-
-
-def _coerce_param_value(raw: str, schema_type: str | None) -> Any:
+def _coerce_param_value(raw: str, schema_type: str | list[str] | None) -> Any:
     """Convert native raw parameter text using the request tool schema."""
+    if isinstance(schema_type, list):
+        schema_type = next(
+            (item for item in schema_type if item != "null"),
+            None,
+        )
+
+    if schema_type == "null":
+        return None if raw.strip() in {"", "null"} else raw
+
     if schema_type == "boolean":
         value = raw.strip().lower()
         if value in {"true", "false"}:
@@ -82,15 +81,18 @@ def _coerce_param_value(raw: str, schema_type: str | None) -> Any:
 
     if schema_type == "number":
         try:
-            return float(raw.strip())
+            value = float(raw.strip())
+            return value if math.isfinite(value) else raw
         except ValueError:
             return raw
 
     if schema_type in {"array", "object"}:
         try:
-            return json.loads(raw)
+            value = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
             return raw
+        expected_type = list if schema_type == "array" else dict
+        return value if isinstance(value, expected_type) else raw
 
     return raw
 
@@ -172,7 +174,11 @@ class AgenticStreamParser:
 
         self._current_function_name: str | None = None
         self._current_param_key: str | None = None
-        self._pending_args: dict[str, Any] = {}
+        self._current_param_type: str | None = None
+        self._current_param_is_string: bool = True
+        self._current_param_first_chunk: bool = True
+        self._current_param_buffer: list[str] = []
+        self._xml_args_count: int = 0
 
         self.incomplete_tool_call_mode: str | None = None
 
@@ -183,8 +189,10 @@ class AgenticStreamParser:
                 self._think_close,
                 self._tool_open or "",
                 self._tool_close or "",
-                _FUNCTION_CLOSE,
-                _PARAM_CLOSE,
+                protocol.function_open or "",
+                protocol.function_close or "",
+                protocol.parameter_open or "",
+                protocol.parameter_close or "",
             )
         )
 
@@ -229,20 +237,36 @@ class AgenticStreamParser:
         out: list[ParserEvent] = []
 
         if self._mode in {"auto", "content", "reasoning"} and self._buf:
-            out.append(
-                ParsedEvent(
-                    kind="reasoning" if self._mode == "reasoning" else "content",
-                    text=self._buf,
+            partial_tool_length = 0
+            if self._tool_open:
+                partial_tool_length = max(
+                    (
+                        length
+                        for length in range(1, len(self._tool_open))
+                        if self._buf.endswith(self._tool_open[:length])
+                    ),
+                    default=0,
                 )
-            )
+            if partial_tool_length:
+                prefix = self._buf[:-partial_tool_length]
+                if prefix:
+                    out.append(
+                        ParsedEvent(
+                            kind="reasoning" if self._mode == "reasoning" else "content",
+                            text=prefix,
+                        )
+                    )
+                self.incomplete_tool_call_mode = "tool_open"
+            else:
+                out.append(
+                    ParsedEvent(
+                        kind="reasoning" if self._mode == "reasoning" else "content",
+                        text=self._buf,
+                    )
+                )
 
-        elif self._mode == "tagged_json_args_stream" and self._buf:
-            out.append(
-                ToolCallFragment(
-                    index=self._tool_index,
-                    arguments_fragment=self._buf,
-                )
-            )
+        elif self._mode == "tagged_json_args_stream":
+            self.incomplete_tool_call_mode = self._mode
 
         elif self._mode in {
             "tagged_json_header",
@@ -253,8 +277,9 @@ class AgenticStreamParser:
             "xml_param_value",
         }:
             self.incomplete_tool_call_mode = self._mode
-            if self._buf:
-                out.append(ParsedEvent(kind="content", text=self._buf))
+            # Do not leak unfinished protocol markup into assistant prose.
+            # Tool-call deltas already streamed to clients are marked invalid by
+            # the final finish_reason/warning and must not be executed.
 
         self._buf = ""
         return out
@@ -305,6 +330,37 @@ class AgenticStreamParser:
         return True
 
     def _step_reasoning(self, out: list[ParserEvent]) -> bool:
+        # Qwen sometimes issues a tool call from *inside* its thinking block and
+        # never writes the closing think tag. A real call is the tool-open tag
+        # followed by the protocol's call syntax; treat it as an implicit end of
+        # reasoning so the call is not swallowed as reasoning text.
+        if self._tool_open and self._supports_tool_protocol:
+            tool_idx = self._buf.find(self._tool_open)
+            close_idx = self._buf.find(self._think_close)
+            if tool_idx >= 0 and (close_idx < 0 or tool_idx < close_idx):
+                probe = self._buf[tool_idx + len(self._tool_open) :].lstrip()
+                expected = (
+                    self.protocol.function_open or "<function="
+                    if self.protocol.tool_call_format == ToolCallFormat.QWEN_XML
+                    else "{"
+                )
+                if probe.startswith(expected):
+                    if tool_idx:
+                        out.append(
+                            ParsedEvent(kind="reasoning", text=self._buf[:tool_idx])
+                        )
+                    self._buf = self._buf[tool_idx + len(self._tool_open) :]
+                    self._tool_index += 1
+                    self._mode = self._native_tool_header_mode
+                    return True
+                if len(probe) < len(expected) and expected.startswith(probe):
+                    return False  # not enough text yet to tell; wait for more
+                # The tag was only mentioned in prose: keep it as reasoning.
+                end = tool_idx + len(self._tool_open)
+                out.append(ParsedEvent(kind="reasoning", text=self._buf[:end]))
+                self._buf = self._buf[end:]
+                return True
+
         idx = self._buf.find(self._think_close)
         if idx < 0:
             safe_len = max(0, len(self._buf) - self._max_tag_len)
@@ -385,17 +441,90 @@ class AgenticStreamParser:
         return True
 
     # ------------------------------------------------------------------
-    # Qwen native function/parameter protocol
+    # Native XML function/parameter protocol (Qwen template family)
     # ------------------------------------------------------------------
 
+    def _find_protocol_tag(self, prefix: str) -> tuple[int, int, str] | None:
+        """Find a complete ``<name=...>``-style protocol tag in the buffer."""
+        start = self._buf.find(prefix)
+        if start < 0:
+            return None
+        end = self._buf.find(">", start + len(prefix))
+        if end < 0:
+            return None
+        value = self._buf[start + len(prefix) : end].strip()
+        if not value:
+            return None
+        return start, end + 1, value
+
+    def _schema_type_for(self, function_name: str, parameter_name: str) -> str | None:
+        """Resolve the JSON-schema type for one native XML parameter."""
+        function_schema = self._tool_schemas.get(function_name, {})
+        properties = function_schema.get("properties", function_schema)
+        if not isinstance(properties, dict):
+            return None
+        parameter_schema = properties.get(parameter_name, {})
+        if not isinstance(parameter_schema, dict):
+            return None
+        schema_type = parameter_schema.get("type")
+        if schema_type is None:
+            for composition in ("anyOf", "oneOf", "allOf"):
+                choices = parameter_schema.get(composition)
+                if isinstance(choices, list):
+                    for choice in choices:
+                        if isinstance(choice, dict) and choice.get("type"):
+                            schema_type = choice["type"]
+                            break
+                if schema_type is not None:
+                    break
+        if isinstance(schema_type, list):
+            schema_type = next((item for item in schema_type if item != "null"), None)
+        return str(schema_type) if schema_type is not None else None
+
+    def _xml_argument_prefix(self, key: str) -> str:
+        separator = "," if self._xml_args_count else "{"
+        return separator + json.dumps(key, ensure_ascii=False) + ":"
+
+    @staticmethod
+    def _json_string_fragment(value: str) -> str:
+        """Encode a fragment for insertion inside an already-open JSON string."""
+        return json.dumps(value, ensure_ascii=False)[1:-1]
+
+    def _consume_xml_string_value(
+        self,
+        raw: str,
+        *,
+        final: bool,
+        out: list[ParserEvent],
+    ) -> None:
+        # Qwen's native template frames parameter values with one newline after
+        # the opening tag and one before the closing tag. Strip only those
+        # framing newlines; preserve any additional user data newlines.
+        if self._current_param_first_chunk:
+            raw = raw.removeprefix("\n")
+            self._current_param_first_chunk = False
+        if final:
+            raw = raw.removesuffix("\n")
+        if raw:
+            out.append(
+                ToolCallFragment(
+                    index=self._tool_index,
+                    arguments_fragment=self._json_string_fragment(raw),
+                )
+            )
+
     def _step_xml_function_header(self, out: list[ParserEvent]) -> bool:
-        match = _FUNCTION_OPEN_RE.search(self._buf)
-        if not match:
+        prefix = self.protocol.function_open or "<function="
+        tag = self._find_protocol_tag(prefix)
+        if tag is None:
             return False
 
-        name = match.group(1).strip()
+        _, end, name = tag
         self._current_function_name = name
-        self._pending_args = {}
+        self._current_param_key = None
+        self._current_param_type = None
+        self._current_param_buffer = []
+        self._xml_args_count = 0
 
         out.append(
             ToolCallFragment(
@@ -404,15 +533,26 @@ class AgenticStreamParser:
                 name=name,
             )
         )
-
-        self._buf = self._buf[match.end() :]
+        self._buf = self._buf[end:]
         self._mode = "xml_param_seek"
         return True
 
     def _step_xml_param_seek(self, out: list[ParserEvent]) -> bool:
-        function_close_idx = self._buf.find(_FUNCTION_CLOSE)
-        match = _PARAM_OPEN_RE.search(self._buf)
-        param_idx = match.start() if match else -1
+        function_close = self.protocol.function_close or "</function>"
+        parameter_open = self.protocol.parameter_open or "<parameter="
+        function_close_idx = self._buf.find(function_close)
+        parameter_tag = self._find_protocol_tag(parameter_open)
+        param_idx = parameter_tag[0] if parameter_tag else -1
+        partial_parameter_idx = self._buf.find(parameter_open)
+
+        if (
+            parameter_tag is None
+            and partial_parameter_idx >= 0
+            and (function_close_idx < 0 or partial_parameter_idx < function_close_idx)
+        ):
+            # A parameter opener can be split across model-token chunks. Do not
+            # mistake a later function close for a valid end-of-arguments.
+            return False
 
         if param_idx < 0 and function_close_idx < 0:
             return False
@@ -420,47 +560,100 @@ class AgenticStreamParser:
         if param_idx >= 0 and (
             function_close_idx < 0 or param_idx < function_close_idx
         ):
-            assert match is not None
-            self._current_param_key = match.group(1).strip()
-            self._buf = self._buf[match.end() :]
+            assert parameter_tag is not None
+            _, end, key = parameter_tag
+            self._current_param_key = key
+            self._current_param_type = self._schema_type_for(
+                self._current_function_name or "", key
+            )
+            self._current_param_is_string = self._current_param_type in {None, "string"}
+            self._current_param_first_chunk = True
+            self._current_param_buffer = []
+
+            prefix = self._xml_argument_prefix(key)
+            if self._current_param_is_string:
+                prefix += '"'
+            if prefix:
+                out.append(
+                    ToolCallFragment(
+                        index=self._tool_index,
+                        arguments_fragment=prefix,
+                    )
+                )
+            self._buf = self._buf[end:]
             self._mode = "xml_param_value"
             return True
 
-        schema = self._tool_schemas.get(self._current_function_name or "", {})
-        typed_args = {
-            key: _coerce_param_value(
-                raw,
-                (schema.get(key) or {}).get("type"),  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
-            )
-            for key, raw in self._pending_args.items()
-        }
-
+        if self._xml_args_count == 0:
+            arguments_suffix = "{}"
+        else:
+            arguments_suffix = "}"
         out.append(
             ToolCallFragment(
                 index=self._tool_index,
-                arguments_fragment=json.dumps(
-                    typed_args,
-                    separators=(",", ":"),
-                ),
+                arguments_fragment=arguments_suffix,
             )
         )
-
-        self._buf = self._buf[function_close_idx + len(_FUNCTION_CLOSE) :]
+        self._buf = self._buf[function_close_idx + len(function_close) :]
         self._mode = "tool_tail"
         return True
 
-    def _step_xml_param_value(self, out: list[ParserEvent]) -> bool:  # pyright: ignore[reportUnusedParameter]
-        idx = self._buf.find(_PARAM_CLOSE)
-        if idx < 0:
+    def _step_xml_param_value(self, out: list[ParserEvent]) -> bool:
+        parameter_close = self.protocol.parameter_close or "</parameter>"
+        idx = self._buf.find(parameter_close)
+        if idx >= 0:
+            raw = self._buf[:idx]
+            self._buf = self._buf[idx + len(parameter_close) :]
+            if self._current_param_is_string:
+                self._consume_xml_string_value(raw, final=True, out=out)
+                out.append(
+                    ToolCallFragment(index=self._tool_index, arguments_fragment='"')
+                )
+            else:
+                if self._current_param_first_chunk:
+                    raw = raw.removeprefix("\n")
+                    self._current_param_first_chunk = False
+                raw = raw.removesuffix("\n")
+                self._current_param_buffer.append(raw)
+                value = _coerce_param_value(
+                    "".join(self._current_param_buffer), self._current_param_type
+                )
+                encoded_value = json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                out.append(
+                    ToolCallFragment(
+                        index=self._tool_index,
+                        arguments_fragment=encoded_value,
+                    )
+                )
+            self._xml_args_count += 1
+            self._current_param_key = None
+            self._current_param_type = None
+            self._current_param_buffer = []
+            self._mode = "xml_param_seek"
+            return True
+
+        # Keep only enough tail to recognize a closing tag split across model
+        # token chunks. String values are JSON-escaped and emitted immediately;
+        # non-string values are buffered until their type can be decoded.
+        # Retain the closing-tag width plus one character for Qwen's framing
+        # newline immediately before the closing tag.
+        safe_length = max(0, len(self._buf) - len(parameter_close))
+        if safe_length <= 0:
             return False
-
-        assert self._current_param_key is not None
-
-        self._pending_args[self._current_param_key] = _trim_param_value(self._buf[:idx])
-        self._buf = self._buf[idx + len(_PARAM_CLOSE) :]
-        self._current_param_key = None
-        self._mode = "xml_param_seek"
-        return True
+        raw = self._buf[:safe_length]
+        self._buf = self._buf[safe_length:]
+        if self._current_param_is_string:
+            self._consume_xml_string_value(raw, final=False, out=out)
+        else:
+            if self._current_param_first_chunk:
+                raw = raw.removeprefix("\n")
+                self._current_param_first_chunk = False
+            self._current_param_buffer.append(raw)
+        return bool(raw)
 
     def _step_tool_tail(self, out: list[ParserEvent]) -> bool:  # pyright: ignore[reportUnusedParameter]
         if not self._tool_close:

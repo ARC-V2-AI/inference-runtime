@@ -10,7 +10,6 @@ import gguf
 
 from arc_v2_inference_runtime.constants import (
     ARC_RUNTIME_DEBUG,
-    ARC_RUNTIME_CONVERSATION_DB_PATH,
     ARC_RUNTIME_CONTEXT_SAFETY_MARGIN,
     ARC_RUNTIME_EMBEDDING_FALLBACK_TO_CHAT,
     ARC_RUNTIME_EMBEDDING_FORMAT,
@@ -27,6 +26,7 @@ from arc_v2_inference_runtime.constants import (
     ARC_RUNTIME_KV_CACHE_TYPE_V,
     ARC_RUNTIME_MODEL_PATH,
     ARC_RUNTIME_MAX_OUTPUT_TOKENS,
+    ARC_RUNTIME_MAX_TOOL_CALL_TOKENS,
     ARC_RUNTIME_N_BATCH,
     ARC_RUNTIME_N_CTX,
     ARC_RUNTIME_N_GPU_LAYERS,
@@ -127,12 +127,12 @@ class EngineConfig:
     embedding_normalize: bool = True
     embedding_fallback_to_chat: bool = False
 
-    # --- Context and transcript persistence ---
-    max_output_tokens: int = 1024
+    # --- Context ---
+    max_output_tokens: int = 3072
+    # Tool calls often contain complete source files or other large values.
+    # Their budget is independent from ordinary assistant prose.
+    max_tool_call_tokens: int = 4096
     context_safety_margin_tokens: int = 16
-    conversation_db_path: Path = field(
-        default_factory=lambda: Path("~/.local/share/arc-v2/inference/conversations.sqlite3").expanduser()
-    )
 
     # --- Sampling defaults ---
     # Used whenever a request doesn't set its own value. Thinking vs
@@ -177,7 +177,7 @@ class EngineConfig:
         if not model_path.is_file():
             raise RuntimeError(f"ARC_RUNTIME_MODEL_PATH does not exist: {model_path}")
 
-        gpu_env = ARC_RUNTIME_N_GPU_LAYERS
+        gpu_env = ARC_RUNTIME_N_GPU_LAYERS.value
         gpu_layers = (
             _auto_gpu_layers(model_path)
             if gpu_env.strip().lower() == "auto"
@@ -185,15 +185,15 @@ class EngineConfig:
         )
 
         # NOTE: N_THREADS = 0 means let llama.cpp decide
-        threads = int(ARC_RUNTIME_N_THREADS) if ARC_RUNTIME_N_THREADS != 0 else None
+        threads = int(ARC_RUNTIME_N_THREADS.value) if ARC_RUNTIME_N_THREADS.value != 0 else None
 
         # NOTE: STOP_SEQUENCE is a list of comma separated values like <|im_end|>,<|endoftext|>
-        stops = [s for s in ARC_RUNTIME_STOP_SEQUENCES.split(",") if s.strip()]
+        stops = [s for s in ARC_RUNTIME_STOP_SEQUENCES.value.split(",") if s.strip()]
 
         embedding_model_path = (
             None
-            if ARC_RUNTIME_EMBEDDING_MODEL_PATH == ""
-            else Path(os.path.expandvars(os.path.expanduser(ARC_RUNTIME_EMBEDDING_MODEL_PATH)))
+            if ARC_RUNTIME_EMBEDDING_MODEL_PATH.value == ""
+            else Path(os.path.expandvars(os.path.expanduser(ARC_RUNTIME_EMBEDDING_MODEL_PATH.value)))
         )
 
         if embedding_model_path is not None and not embedding_model_path.is_file():
@@ -201,63 +201,78 @@ class EngineConfig:
                 f"ARC_RUNTIME_EMBEDDING_MODEL_PATH does not exist: {embedding_model_path}"
             )
 
-        if ARC_RUNTIME_N_CTX < 256:
+        if ARC_RUNTIME_N_CTX.value < 256:
             raise RuntimeError("ARC_RUNTIME_N_CTX must be at least 256")
-        if ARC_RUNTIME_MAX_OUTPUT_TOKENS < 1:
+        if ARC_RUNTIME_MAX_OUTPUT_TOKENS.value < 1:
             raise RuntimeError("ARC_RUNTIME_MAX_OUTPUT_TOKENS must be positive")
-        if ARC_RUNTIME_CONTEXT_SAFETY_MARGIN < 0:
+        if ARC_RUNTIME_MAX_TOOL_CALL_TOKENS.value < 1:
+            raise RuntimeError("ARC_RUNTIME_MAX_TOOL_CALL_TOKENS must be positive")
+        if ARC_RUNTIME_CONTEXT_SAFETY_MARGIN.value < 0:
             raise RuntimeError("ARC_RUNTIME_CONTEXT_SAFETY_MARGIN cannot be negative")
-        if ARC_RUNTIME_EMBEDDING_N_CTX < 1:
+        if (
+            ARC_RUNTIME_MAX_TOOL_CALL_TOKENS.value
+            + ARC_RUNTIME_CONTEXT_SAFETY_MARGIN.value
+            >= ARC_RUNTIME_N_CTX.value
+        ):
+            raise RuntimeError(
+                "ARC_RUNTIME_MAX_TOOL_CALL_TOKENS plus the context safety margin "
+                "must be smaller than ARC_RUNTIME_N_CTX"
+            )
+        if ARC_RUNTIME_EMBEDDING_N_CTX.value < 1:
             raise RuntimeError("ARC_RUNTIME_EMBEDDING_N_CTX must be positive")
-        if ARC_RUNTIME_EMBEDDING_N_BATCH < 1:
+        if ARC_RUNTIME_EMBEDDING_N_BATCH.value < 1:
             raise RuntimeError("ARC_RUNTIME_EMBEDDING_N_BATCH must be positive")
-        if ARC_RUNTIME_EMBEDDING_FORMAT.strip().lower() not in {"qwen3", "plain"}:
+        if ARC_RUNTIME_EMBEDDING_FORMAT.value.strip().lower() not in {"qwen3", "plain"}:
             raise RuntimeError("ARC_RUNTIME_EMBEDDING_FORMAT must be 'qwen3' or 'plain'")
-        if ARC_RUNTIME_EMBEDDING_POOLING.strip().lower() not in _POOLING_VALUES:
+        if ARC_RUNTIME_EMBEDDING_POOLING.value.strip().lower() not in _POOLING_VALUES:
             raise RuntimeError(
                 "ARC_RUNTIME_EMBEDDING_POOLING must be one of: unspecified, mean, cls, last"
             )
         if (
-            ARC_RUNTIME_EMBEDDING_FORMAT.strip().lower() == "qwen3"
-            and ARC_RUNTIME_EMBEDDING_POOLING.strip().lower() != "last"
+            ARC_RUNTIME_EMBEDDING_FORMAT.value.strip().lower() == "qwen3"
+            and ARC_RUNTIME_EMBEDDING_POOLING.value.strip().lower() != "last"
         ):
             raise RuntimeError(
                 "Qwen3-Embedding requires ARC_RUNTIME_EMBEDDING_POOLING=last"
             )
 
+        # Convert ARC Constant wrappers into native Python values at the
+        # configuration boundary. In particular, string-valued Constants are
+        # not necessarily instances of builtins.str and cannot safely be
+        # serialized by Starlette's JSONResponse.
         return cls(
-            model_path=model_path,
-            n_ctx=ARC_RUNTIME_N_CTX,
+            model_path=Path(model_path),
+            n_ctx=int(ARC_RUNTIME_N_CTX.value),
             n_threads=threads,
-            n_batch=ARC_RUNTIME_N_BATCH,
-            n_gpu_layers=gpu_layers,
-            embedding_pooling=ARC_RUNTIME_EMBEDDING_POOLING,
-            generation_timeout_s=ARC_RUNTIME_GEN_TIMEOUT_S,
-            verbose=ARC_RUNTIME_VERBOSE,
-            tool_protocol=ARC_RUNTIME_TOOL_PROTOCOL,
-            stop_sequences=stops,
-            flash_attn=ARC_RUNTIME_FLASH_ATTN,
-            kv_cache_type_k=ARC_RUNTIME_KV_CACHE_TYPE_K,
-            kv_cache_type_v=ARC_RUNTIME_KV_CACHE_TYPE_V,
+            n_batch=int(ARC_RUNTIME_N_BATCH.value),
+            n_gpu_layers=int(gpu_layers),
+            embedding_pooling=str(ARC_RUNTIME_EMBEDDING_POOLING.value).strip().lower(),
+            generation_timeout_s=float(ARC_RUNTIME_GEN_TIMEOUT_S.value),
+            verbose=bool(ARC_RUNTIME_VERBOSE.value),
+            tool_protocol=str(ARC_RUNTIME_TOOL_PROTOCOL.value).strip().lower(),
+            stop_sequences=[str(item) for item in stops],
+            flash_attn=bool(ARC_RUNTIME_FLASH_ATTN.value),
+            kv_cache_type_k=str(ARC_RUNTIME_KV_CACHE_TYPE_K.value).strip().lower(),
+            kv_cache_type_v=str(ARC_RUNTIME_KV_CACHE_TYPE_V.value).strip().lower(),
             embedding_model_path=embedding_model_path,
-            embedding_n_ctx=ARC_RUNTIME_EMBEDDING_N_CTX,
-            embedding_n_batch=ARC_RUNTIME_EMBEDDING_N_BATCH,
-            embedding_n_gpu_layers=ARC_RUNTIME_EMBEDDING_N_GPU_LAYERS,
-            embedding_format=ARC_RUNTIME_EMBEDDING_FORMAT.strip().lower(),
-            embedding_normalize=ARC_RUNTIME_EMBEDDING_NORMALIZE,
-            embedding_fallback_to_chat=ARC_RUNTIME_EMBEDDING_FALLBACK_TO_CHAT,
-            max_output_tokens=ARC_RUNTIME_MAX_OUTPUT_TOKENS,
-            context_safety_margin_tokens=ARC_RUNTIME_CONTEXT_SAFETY_MARGIN,
-            conversation_db_path=ARC_RUNTIME_CONVERSATION_DB_PATH,
-            sampling_temperature_thinking=ARC_RUNTIME_SAMPLING_TEMPERATURE_THINKING,
-            sampling_top_p_thinking=ARC_RUNTIME_SAMPLING_TOP_P_THINKING,
-            sampling_top_k_thinking=ARC_RUNTIME_SAMPLING_TOP_K_THINKING,
-            sampling_min_p_thinking=ARC_RUNTIME_SAMPLING_MIN_P_THINKING,
-            sampling_temperature=ARC_RUNTIME_SAMPLING_TEMPERATURE,
-            sampling_top_p=ARC_RUNTIME_SAMPLING_TOP_P,
-            sampling_top_k=ARC_RUNTIME_SAMPLING_TOP_K,
-            sampling_min_p=ARC_RUNTIME_SAMPLING_MIN_P,
-            sampling_repeat_penalty=ARC_RUNTIME_SAMPLING_REPEAT_PENALTY,
-            grammar_constrained_tools=ARC_RUNTIME_GRAMMAR_CONSTRAINED_TOOLS,
-            debug_trace=ARC_RUNTIME_DEBUG,
+            embedding_n_ctx=int(ARC_RUNTIME_EMBEDDING_N_CTX.value),
+            embedding_n_batch=int(ARC_RUNTIME_EMBEDDING_N_BATCH.value),
+            embedding_n_gpu_layers=str(ARC_RUNTIME_EMBEDDING_N_GPU_LAYERS.value).strip().lower(),
+            embedding_format=str(ARC_RUNTIME_EMBEDDING_FORMAT.value).strip().lower(),
+            embedding_normalize=bool(ARC_RUNTIME_EMBEDDING_NORMALIZE.value),
+            embedding_fallback_to_chat=bool(ARC_RUNTIME_EMBEDDING_FALLBACK_TO_CHAT.value),
+            max_output_tokens=int(ARC_RUNTIME_MAX_OUTPUT_TOKENS.value),
+            max_tool_call_tokens=int(ARC_RUNTIME_MAX_TOOL_CALL_TOKENS.value),
+            context_safety_margin_tokens=int(ARC_RUNTIME_CONTEXT_SAFETY_MARGIN.value),
+            sampling_temperature_thinking=float(ARC_RUNTIME_SAMPLING_TEMPERATURE_THINKING.value),
+            sampling_top_p_thinking=float(ARC_RUNTIME_SAMPLING_TOP_P_THINKING.value),
+            sampling_top_k_thinking=int(ARC_RUNTIME_SAMPLING_TOP_K_THINKING.value),
+            sampling_min_p_thinking=float(ARC_RUNTIME_SAMPLING_MIN_P_THINKING.value),
+            sampling_temperature=float(ARC_RUNTIME_SAMPLING_TEMPERATURE.value),
+            sampling_top_p=float(ARC_RUNTIME_SAMPLING_TOP_P.value),
+            sampling_top_k=int(ARC_RUNTIME_SAMPLING_TOP_K.value),
+            sampling_min_p=float(ARC_RUNTIME_SAMPLING_MIN_P.value),
+            sampling_repeat_penalty=float(ARC_RUNTIME_SAMPLING_REPEAT_PENALTY.value),
+            grammar_constrained_tools=bool(ARC_RUNTIME_GRAMMAR_CONSTRAINED_TOOLS.value),
+            debug_trace=bool(ARC_RUNTIME_DEBUG.value),
         )

@@ -75,6 +75,7 @@ def fit_chat_context(
     context_window: int,
     output_tokens: int,
     safety_margin_tokens: int = 16,
+    overflow: str = "truncate",
 ) -> ContextFit:
     """Drop oldest complete user turns until prompt + output fit.
 
@@ -82,6 +83,8 @@ def fit_chat_context(
     minimum viable prompt is still too large, raise ContextLengthError and let
     the caller return a useful client error rather than silently truncating it.
     """
+    if overflow not in {"reject", "truncate"}:
+        raise ValueError("overflow must be 'reject' or 'truncate'")
     if context_window < 1:
         raise ValueError("context_window must be positive")
     if output_tokens < 1:
@@ -113,13 +116,13 @@ def fit_chat_context(
                 dropped_turns=dropped_turns,
             )
 
-        if len(turns) <= 1:
+        if overflow == "reject" or len(turns) <= 1:
             raise ContextLengthError(
                 "The system instructions and newest conversation turn do not fit "
                 f"the configured context window: prompt={prompt_tokens}, "
                 f"output_reserved={output_tokens}, safety_margin={safety_margin_tokens}, "
                 f"context_window={context_window}. Shorten the current input or "
-                "increase ARC_RUNTIME_N_CTX."
+                "increase the request context_limit or ARC_RUNTIME_N_CTX."
             )
 
         turns.pop(0)

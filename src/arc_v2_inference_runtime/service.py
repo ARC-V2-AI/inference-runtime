@@ -14,7 +14,7 @@ class InferenceRuntime(Service):
     def __init__(self) -> None:
         super().__init__(
             name="ARC Inference Runtime Server",
-            version="0.1.0",
+            version="0.3.1",
             description="Inference server backend for ARC",
         )
 

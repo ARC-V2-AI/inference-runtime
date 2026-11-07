@@ -22,13 +22,14 @@ class _Job:
 
 
 _SENTINEL_DONE = object()
+_STOP_WORKER = object()
 
 
 class RequestQueue:
     """FIFO queue of generation jobs, executed one at a time on a worker thread."""
 
     def __init__(self) -> None:
-        self._queue: asyncio.Queue[_Job] = asyncio.Queue()
+        self._queue: asyncio.Queue[_Job | object] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None  # pyright: ignore[reportMissingTypeArgument]
         self._jobs: dict[str, _Job] = {}
 
@@ -37,9 +38,19 @@ class RequestQueue:
             self._worker_task = asyncio.create_task(self._worker_loop())
 
     async def stop(self) -> None:
-        if self._worker_task is not None:
-            self._worker_task.cancel()
+        """Drain queued work and stop without unloading a model mid-generation."""
+        task = self._worker_task
+        if task is not None:
+            await self._queue.put(_STOP_WORKER)
+            await task
             self._worker_task = None
+
+    def status(self) -> dict[str, int | bool]:
+        return {
+            "running": self._worker_task is not None and not self._worker_task.done(),
+            "pending": self._queue.qsize(),
+            "active": int(bool(self._jobs)),
+        }
 
     async def submit(
         self,
@@ -85,8 +96,12 @@ class RequestQueue:
 
     async def _worker_loop(self) -> None:
         while True:
-            job = await self._queue.get()
-            await self._run_job(job)
+            item = await self._queue.get()
+            if item is _STOP_WORKER:
+                return
+            if not isinstance(item, _Job):
+                continue
+            await self._run_job(item)
 
     async def _run_job(self, job: _Job) -> None:
         loop = job.loop or asyncio.get_running_loop()
@@ -97,9 +112,10 @@ class RequestQueue:
                     if job.cancel_event.is_set():
                         break
                     loop.call_soon_threadsafe(job.out_queue.put_nowait, chunk)
-                loop.call_soon_threadsafe(job.out_queue.put_nowait, _SENTINEL_DONE)
             except Exception as exc:  # surface to the awaiting consumer
                 loop.call_soon_threadsafe(job.out_queue.put_nowait, exc)
+            finally:
+                loop.call_soon_threadsafe(job.out_queue.put_nowait, _SENTINEL_DONE)
 
         thread = threading.Thread(target=_thread_target, daemon=True)
         thread.start()

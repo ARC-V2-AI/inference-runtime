@@ -70,11 +70,16 @@ class GenerationRequest(BaseModel):
     stop: list[str] = Field(default_factory=list)
     response_format: dict[str, Any] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    context_limit: int | None = Field(default=None, ge=256)
+    context_overflow: Literal["reject", "truncate"] = "truncate"
 
 
 class ChatRequest(GenerationRequest):
     messages: list[ChatMessage] = Field(min_length=1)
     tools: list[Tool] = Field(default_factory=list)
+    # Optional per-request override for calls that need to transport large
+    # string arguments (for example, generated source files).
+    max_tool_call_tokens: int | None = Field(default=None, ge=1)
     tool_choice: Literal["auto", "none", "required"] | NamedToolChoice | None = None
     reasoning_effort: ReasoningEffort = "auto"
 
@@ -100,10 +105,6 @@ class TokenizeRequest(BaseModel):
     special: bool = True
 
 
-class ConversationCreateRequest(BaseModel):
-    title: str | None = Field(default=None, max_length=256)
-
-
 class ChatCompletionChoice(BaseModel):
     index: int = 0
     message: ChatMessage
@@ -117,6 +118,7 @@ class ChatCompletionResponse(BaseModel):
     created: int
     model: str
     choices: list[ChatCompletionChoice]
+    usage: dict[str, int] = Field(default_factory=dict)
 
 
 class ChatCompletionChunkDelta(BaseModel):
@@ -139,6 +141,7 @@ class ChatCompletionChunk(BaseModel):
     created: int
     model: str
     choices: list[ChatCompletionChunkChoice]
+    usage: dict[str, int] | None = None
 
 
 class EmbeddingData(BaseModel):

@@ -231,17 +231,25 @@ class Model:
         except ValueError as exc:
             raise RuntimeError(f"Unknown ARC_RUNTIME_TOOL_PROTOCOL={value!r}") from exc
         defaults = {
-            ToolCallFormat.QWEN_XML: ("<tool_call>", "</tool_call>"),
-            ToolCallFormat.TAGGED_JSON: ("<tool_call>", "</tool_call>"),
+            ToolCallFormat.QWEN_XML: {
+                "tool_open": "<tool_call>",
+                "tool_close": "</tool_call>",
+                "function_open": "<function=",
+                "function_close": "</function>",
+                "parameter_open": "<parameter=",
+                "parameter_close": "</parameter>",
+            },
+            ToolCallFormat.TAGGED_JSON: {
+                "tool_open": "<tool_call>",
+                "tool_close": "</tool_call>",
+            },
         }
-        tool_open, tool_close = defaults.get(tool_protocol, (None, None))
         return ModelProtocol(
             tool_call_format=tool_protocol,
             reasoning_format=detected.reasoning_format,
             think_open=detected.think_open,
             think_close=detected.think_close,
-            tool_open=tool_open,
-            tool_close=tool_close,
+            **defaults.get(tool_protocol, {}),
         )
 
     def _perf_kwargs(self):  # pyright: ignore[reportUnknownParameterType]
@@ -380,5 +388,52 @@ class Model:
             self._protocol.think_close,
         )
 
+    def clear_kv_cache(self) -> None:
+        """Remove all sequence state while keeping model/KV allocations loaded.
+
+        llama-cpp-python 0.3.36 exposes sequence removal through its context
+        wrapper.  The high-level Llama.reset() only resets the Python token
+        counter for ordinary transformer models, so it is not sufficient on
+        its own to clear the underlying KV sequence.
+        """
+        instance = self.instance
+        context = getattr(instance, "_ctx", None)
+        clear_cache = getattr(context, "kv_cache_clear", None)
+        if callable(clear_cache):
+            # This clears cache cell metadata and zeroes KV data buffers. It
+            # does not free the buffers or their VRAM allocations.
+            clear_cache()
+        else:
+            remove_sequence = getattr(context, "kv_cache_seq_rm", None)
+            if not callable(remove_sequence):
+                raise RuntimeError(
+                    "The installed llama-cpp-python build does not expose "
+                    "KV cache clearing or sequence removal."
+                )
+            remove_sequence(-1, 0, -1)
+        # reset() also clears recurrent/hybrid memory state on supported builds.
+        instance.reset()
+
     def unload(self) -> None:
+        """Explicitly release the llama.cpp context, batch and model resources."""
+        instance = self._model
+        if instance is not None:
+            close = getattr(instance, "close", None)
+            if callable(close):
+                close()
+            else:
+                # llama-cpp-python 0.3.36 owns native objects in an ExitStack.
+                # Closing it releases the context before the model (LIFO order).
+                stack = getattr(instance, "_stack", None)
+                stack_close = getattr(stack, "close", None)
+                if not callable(stack_close):
+                    raise RuntimeError(
+                        "Cannot explicitly close llama.cpp resources with this "
+                        "llama-cpp-python version."
+                    )
+                stack_close()
         self._model = None
+        self._renderer = None
+        self._protocol = None
+        self._info = None
+        self._capabilities = None

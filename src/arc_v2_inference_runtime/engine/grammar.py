@@ -77,26 +77,67 @@ def _body_grammar(protocol: ModelProtocol, tools: list[Tool]) -> str | None:
     function_name_rule = _function_name_rule(tools)
 
     if protocol.tool_call_format == ToolCallFormat.QWEN_XML:
+        tool_open = protocol.tool_open or "<tool_call>"
+        tool_close = protocol.tool_close or "</tool_call>"
+        function_open = protocol.function_open or "<function="
+        function_close = protocol.function_close or "</function>"
+        parameter_open = protocol.parameter_open or "<parameter="
+        parameter_close = protocol.parameter_close or "</parameter>"
         return (
             "body          ::= plain-text | (plain-text tool-call)\n"
             "plain-text    ::= plain-char*\n"
             "plain-char    ::= [^<]\n"
-            + r'tool-call     ::= "<tool_call>\n<function=" function-name ">\n" parameter* "</function>\n</tool_call>" "\n"?'
-            + "\n"
+            + "tool-call     ::= "
+            + json.dumps(tool_open)
+            + " "
+            + json.dumps("\n")
+            + " "
+            + json.dumps(function_open)
+            + " function-name "
+            + json.dumps(">\n")
+            + " parameter* "
+            + json.dumps(function_close)
+            + " "
+            + json.dumps("\n")
+            + " "
+            + json.dumps(tool_close)
+            + " "
+            + json.dumps("\n")
+            + "?\n"
             + f"function-name ::= {function_name_rule}\n"
-            + r'parameter     ::= "<parameter=" param-name ">\n" param-value "\n</parameter>\n"'
+            + "parameter     ::= "
+            + json.dumps(parameter_open)
+            + " param-name "
+            + json.dumps(">\n")
+            + " param-value "
+            + json.dumps("\n")
+            + " "
+            + json.dumps(parameter_close)
             + "\n"
-            "param-name    ::= plain-char+\n"
-            "param-value   ::= [^<]*\n"
+            + "param-name    ::= plain-char+\n"
+            + "param-value   ::= [^<]*\n"
         )
 
     if protocol.tool_call_format == ToolCallFormat.TAGGED_JSON:
+        tool_open = protocol.tool_open or "<tool_call>"
+        tool_close = protocol.tool_close or "</tool_call>"
         return (
             "body          ::= plain-text | (plain-text tool-call)\n"
             "plain-text    ::= plain-char*\n"
             "plain-char    ::= [^<]\n"
-            + r'tool-call     ::= "<tool_call>\n{\"name\": \"" function-name "\", \"arguments\": " json-value "}\n</tool_call>" "\n"?'
-            + "\n"
+            + "tool-call     ::= "
+            + json.dumps(tool_open)
+            + " "
+            + json.dumps('\n{"name": "')
+            + " function-name "
+            + json.dumps('", "arguments": ')
+            + " json-value "
+            + json.dumps("}\n")
+            + " "
+            + json.dumps(tool_close)
+            + " "
+            + json.dumps("\n")
+            + "?\n"
             + f"function-name ::= {function_name_rule}\n"
             + _JSON_GRAMMAR
         )

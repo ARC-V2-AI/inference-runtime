@@ -51,6 +51,13 @@ class ModelProtocol(BaseModel):
     think_close: str | None = None
     tool_open: str | None = None
     tool_close: str | None = None
+    # Function/parameter delimiters are protocol metadata, not parser
+    # constants. Keeping them here makes the XML-style parser reusable across
+    # Qwen model revisions and compatible template variants.
+    function_open: str | None = None
+    function_close: str | None = None
+    parameter_open: str | None = None
+    parameter_close: str | None = None
 
     @property
     def supports_tools(self) -> bool:
@@ -94,6 +101,10 @@ def detect_model_protocols(template: str | None) -> ModelProtocol:
             think_close="</think>" if "</think>" in template else None,
             tool_open="<tool_call>",
             tool_close="</tool_call>",
+            function_open="<function=",
+            function_close="</function>",
+            parameter_open="<parameter=",
+            parameter_close="</parameter>",
         )
 
     if "<|channel|>analysis<|message|>" in template and "to=functions." in template:

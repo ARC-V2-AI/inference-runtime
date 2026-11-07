@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import logging
 import time
@@ -7,9 +9,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from arc_v2_inference_runtime.constants import ARC_RUNTIME_DEBUG
-from arc_v2_inference_runtime.engine.engine import Engine, GenerationChunk
 from arc_v2_inference_runtime.engine.context_manager import ContextLengthError
-from arc_v2_inference_runtime.engine.conversations import ConversationNotFoundError
+from arc_v2_inference_runtime.engine.engine import Engine, GenerationChunk
 from arc_v2_inference_runtime.types import (
     ChatCompletionChoice,
     ChatCompletionChunk,
@@ -24,7 +25,6 @@ from arc_v2_inference_runtime.types import (
     EmbeddingResponse,
     ModelInfo,
     TokenizeRequest,
-    ConversationCreateRequest,
     ToolCall,
     ToolCallDelta,
     ToolCallFunction,
@@ -43,7 +43,7 @@ def version_string(path: str) -> str:
 def _get_engine(request: Request) -> Engine:
     engine = getattr(request.app.state, "engine", None)
     if engine is None:
-        raise HTTPException(status_code=503, detail="Model is not loaded yet")
+        raise HTTPException(status_code=503, detail="Inference runtime is not initialized")
     return engine
 
 
@@ -56,6 +56,9 @@ class _Accumulator:
         self.content_parts: list[str] = []
         self.reasoning_parts: list[str] = []
         self._tool_calls: dict[int, dict] = {}
+        self.usage: dict[str, int] = {}
+        self.finish_reason: str | None = None
+        self.warning: str | None = None
 
     def add(self, chunk: GenerationChunk) -> None:
         if chunk.event:
@@ -73,10 +76,19 @@ class _Accumulator:
             if tc.name:
                 entry["name"] = tc.name
             entry["arguments"] += tc.arguments_fragment or ""
+        if chunk.usage:
+            self.usage = chunk.usage
+        if chunk.finish_reason:
+            self.finish_reason = chunk.finish_reason
+        if chunk.warning:
+            self.warning = chunk.warning
 
     def to_message(self) -> ChatMessage:
         tool_calls = None
-        if self._tool_calls:
+        # Streaming clients may have received partial tool-call deltas before
+        # generation hit its token limit. Never expose those as executable
+        # non-streaming calls unless the engine confirmed protocol completion.
+        if self._tool_calls and self.finish_reason == "tool_calls":
             tool_calls = [
                 ToolCall(
                     id=entry["id"] or _new_id("call"),
@@ -94,50 +106,23 @@ class _Accumulator:
         )
 
 
-async def _chat_completions(
-    req: ChatRequest,
-    request: Request,
-    *,
-    conversation_id: str | None = None,
-):
+async def _chat_completions(req: ChatRequest, request: Request):
     engine = _get_engine(request)
     completion_id = _new_id("chatcmpl")
     created = int(time.time())
-    new_messages = list(req.messages)
-
-    if conversation_id is not None:
-        try:
-            history = engine.conversations.get_messages(conversation_id)
-        except ConversationNotFoundError as exc:
-            raise HTTPException(status_code=404, detail="Conversation not found") from exc
-        # This endpoint deliberately accepts only the new turn. Send transcript
-        # messages through GET /conversations/{id}; do not resend the old history.
-        if any(message.role == "system" for message in new_messages) and history:
-            raise HTTPException(
-                status_code=400,
-                detail="A persisted conversation already has history; send only new user/tool messages, not the system prompt or prior turns.",
-            )
-        req = req.model_copy(update={"messages": [*history, *new_messages]})
 
     try:
-        req = engine.fit_chat_request(req)
+        fitted = engine.fit_chat_request(req)
     except ContextLengthError as exc:
         raise HTTPException(status_code=413, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    if conversation_id is not None:
-        try:
-            engine.conversations.append_messages(conversation_id, new_messages)
-        except ConversationNotFoundError as exc:
-            raise HTTPException(status_code=404, detail="Conversation not found") from exc
-
-    if req.stream:
-
+    if fitted.stream:
         async def event_stream():
             sent_role = False
             acc = _Accumulator()
-            async for chunk in engine.generate_chat(req):
+            async for chunk in engine.generate_chat(fitted):
                 acc.add(chunk)
                 delta = ChatCompletionChunkDelta()
                 if not sent_role:
@@ -171,44 +156,35 @@ async def _chat_completions(
                             warning=chunk.warning,
                         )
                     ],
+                    usage=chunk.usage,
                 )
-                yield f"data: {out.model_dump_json()}\n\n"
-            if conversation_id is not None:
-                engine.conversations.append_messages(conversation_id, [acc.to_message()])
+                yield f"data: {out.model_dump_json(exclude_none=True)}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     acc = _Accumulator()
-    finish_reason = None
-    warning = None
-    async for chunk in engine.generate_chat(req):
+    async for chunk in engine.generate_chat(fitted):
         acc.add(chunk)
-        if chunk.finish_reason:
-            finish_reason = chunk.finish_reason
-        if chunk.warning:
-            warning = chunk.warning
     message = acc.to_message()
-    if conversation_id is not None:
-        engine.conversations.append_messages(conversation_id, [message])
     return ChatCompletionResponse(
         id=completion_id,
         created=created,
         model=engine.model_name,
-        choices=[ChatCompletionChoice(message=message, finish_reason=finish_reason, warning=warning)],
+        choices=[
+            ChatCompletionChoice(
+                message=message,
+                finish_reason=acc.finish_reason,
+                warning=acc.warning,
+            )
+        ],
+        usage=acc.usage,
     )
 
 
 @app.post(version_string("/chat/completions"))
 async def chat_completions(req: ChatRequest, request: Request):
     return await _chat_completions(req, request)
-
-
-@app.post(version_string("/conversations/{conversation_id}/chat/completions"))
-async def conversation_chat_completions(
-    conversation_id: str, req: ChatRequest, request: Request
-):
-    return await _chat_completions(req, request, conversation_id=conversation_id)
 
 
 @app.post(version_string("/completions"))
@@ -220,11 +196,13 @@ async def completions(req: CompletionRequest, request: Request):
         req = engine.fit_completion_request(req)
     except ContextLengthError as exc:
         raise HTTPException(status_code=413, detail=str(exc)) from exc
-    if req.stream:
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    if req.stream:
         async def event_stream():
             async for chunk in engine.generate_completion(req):
-                if not chunk.event or chunk.event.kind != "content":
+                if (not chunk.event or chunk.event.kind != "content") and not chunk.usage:
                     continue
                 payload = {
                     "id": completion_id,
@@ -234,22 +212,28 @@ async def completions(req: CompletionRequest, request: Request):
                     "choices": [
                         {
                             "index": 0,
-                            "text": chunk.event.text,
+                            "text": chunk.event.text if chunk.event else "",
                             "finish_reason": chunk.finish_reason,
                         }
                     ],
                 }
+                if chunk.usage:
+                    payload["usage"] = chunk.usage
                 yield f"data: {json.dumps(payload)}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
+
     text_parts: list[str] = []
     finish_reason = None
+    usage: dict[str, int] = {}
     async for chunk in engine.generate_completion(req):
         if chunk.event and chunk.event.kind == "content":
             text_parts.append(chunk.event.text)
         if chunk.finish_reason:
             finish_reason = chunk.finish_reason
+        if chunk.usage:
+            usage = chunk.usage
     return {
         "id": completion_id,
         "object": "text_completion",
@@ -258,6 +242,7 @@ async def completions(req: CompletionRequest, request: Request):
         "choices": [
             {"index": 0, "text": "".join(text_parts), "finish_reason": finish_reason}
         ],
+        "usage": usage,
     }
 
 
@@ -284,17 +269,21 @@ async def tokenize(req: TokenizeRequest, request: Request):
     engine = _get_engine(request)
     inputs = [req.input] if isinstance(req.input, str) else req.input
     data = []
-    for index, value in enumerate(inputs):
-        token_ids = engine.tokenize(value, add_bos=req.add_bos, special=req.special)
-        item = {"index": index, "token_count": len(token_ids)}
-        if req.include_tokens:
-            item["tokens"] = token_ids
-        data.append(item)
+    try:
+        for index, value in enumerate(inputs):
+            token_ids = engine.tokenize(value, add_bos=req.add_bos, special=req.special)
+            item = {"index": index, "token_count": len(token_ids)}
+            if req.include_tokens:
+                item["tokens"] = token_ids
+            data.append(item)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {"object": "list", "model": engine.model_name, "data": data}
 
 
-@app.post(version_string("/chat/context"))
-async def chat_context(req: ChatRequest, request: Request):
+@app.post(version_string("/context/inspect"))
+@app.post(version_string("/chat/context"), include_in_schema=False)
+async def inspect_context(req: ChatRequest, request: Request):
     engine = _get_engine(request)
     try:
         return {"model": engine.model_name, **engine.count_chat_context(req)}
@@ -302,35 +291,28 @@ async def chat_context(req: ChatRequest, request: Request):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post(version_string("/conversations"))
-async def create_conversation(req: ConversationCreateRequest, request: Request):
-    engine = _get_engine(request)
-    return engine.conversations.create(req.title)
+@app.get(version_string("/runtime/status"))
+async def runtime_status(request: Request):
+    return _get_engine(request).runtime_status()
 
 
-@app.get(version_string("/conversations"))
-async def list_conversations(request: Request, limit: int = 100):
-    engine = _get_engine(request)
-    return {"object": "list", "data": engine.conversations.list(limit=limit)}
+@app.get(version_string("/runtime/memory"))
+async def runtime_memory(request: Request):
+    return _get_engine(request).memory_status()
 
 
-@app.get(version_string("/conversations/{conversation_id}"))
-async def get_conversation(conversation_id: str, request: Request):
+@app.post(version_string("/runtime/cache/clear"))
+async def clear_runtime_cache(request: Request):
     engine = _get_engine(request)
     try:
-        conversation = engine.conversations.get(conversation_id)
-        messages = engine.conversations.get_messages(conversation_id)
-    except ConversationNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="Conversation not found") from exc
-    return {**conversation, "messages": [message.model_dump(mode="json", exclude_none=True) for message in messages]}
-
-
-@app.delete(version_string("/conversations/{conversation_id}"))
-async def delete_conversation(conversation_id: str, request: Request):
-    engine = _get_engine(request)
-    if not engine.conversations.delete(conversation_id):
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    return {"id": conversation_id, "deleted": True}
+        result = await engine.clear_kv_cache()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {
+        **result,
+        "scope": "global_active_sequence",
+        "allocated_vram_released": False,
+    }
 
 
 @app.get(version_string("/models"))
