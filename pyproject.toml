@@ -39,6 +39,7 @@ reportExplicitAny = false
 
 
 [tool.arc.service]
+# Current build targets NVIDIA GPU inference only, using the CUDA-enabled llama.cpp build.
 id = "inference-runtime"
 module = "arc_v2_inference_runtime.service"
 name = "ARC Inference Runtime Server"
@@ -46,3 +47,8 @@ description = "Inference server backend for ARC"
 restart = "on-failure"
 health = "restart"
 depends = []
+
+system_dependencies = [
+    { kind = "shared-library", name = "libcudart.so.13", required = true },
+    { kind = "shared-library", name = "libcuda.so.1", required = true },
+]
