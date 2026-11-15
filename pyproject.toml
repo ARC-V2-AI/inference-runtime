@@ -1,6 +1,6 @@
 [project]
 name = "arc-v2-inference-runtime"
-version = "0.3.3"
+version = "0.3.4"
 description = "Arc-V2's backend inference server runtime."
 readme = "README.md"
 authors = [{ name = "PauWol", email = "paul22wof@proton.me" }]
