@@ -274,17 +274,37 @@ class Engine:
             )
         return req.model_copy(update={"messages": result.messages})
 
-    def fit_completion_request(self, req: CompletionRequest) -> CompletionRequest:
+    def fit_completion_request(self, req: CompletionRequest):
         output_tokens = req.max_output_tokens or self.config.max_output_tokens
-        prompt_tokens = self.count_tokens(req.prompt, add_bos=True, special=True)
+
+        prompt_token_ids = self.tokenize(
+            req.prompt,
+            add_bos=True,
+            special=True,
+        )
+        prompt_tokens = len(prompt_token_ids)
+
+        if prompt_tokens == 0:
+            logger.warning(
+                "completion_rejected: prompt produced zero tokens "
+                "prompt_chars=%d model=%s",
+                len(req.prompt),
+                self.model_name,
+            )
+            raise ValueError(
+                "Completion prompt produced zero tokens. "
+                "A non-empty tokenized prompt is required."
+            )
+
         validate_prompt_fits(
             prompt_tokens,
             context_window=self._request_context_limit(req.context_limit),
             output_tokens=output_tokens,
             safety_margin_tokens=self.config.context_safety_margin_tokens,
         )
-        return req.model_copy(update={"max_output_tokens": output_tokens})
 
+        return req.model_copy(update={"max_output_tokens": output_tokens})
+        
     async def clear_kv_cache(self) -> dict[str, Any]:
         """Clear the active shared sequence after all earlier queued work.
 
@@ -759,20 +779,6 @@ class Engine:
                         else:
                             yield GenerationChunk(event=event)
 
-                    warning = None
-                    if parser.incomplete_tool_call_mode:
-                        warning = (
-                            "tool_call_incomplete: parser stopped in "
-                            f"{parser.incomplete_tool_call_mode!r}"
-                        )
-                        logger.warning(
-                            "%s model=%s finish_reason=%s stop_sequences=%s",
-                            warning,
-                            self.model_name,
-                            last_finish or "unknown",
-                            context.stop,
-                        )
-
                     completion_tokens = len(
                         self.model.instance.tokenize(
                             "".join(raw_parts).encode("utf-8"),
@@ -780,6 +786,39 @@ class Engine:
                             special=True,
                         )
                     )
+
+                    warning = None
+
+                    if parser.incomplete_tool_call_mode:
+                        warning = (
+                            "tool_call_incomplete: parser stopped in "
+                            f"{parser.incomplete_tool_call_mode!r}"
+                        )
+
+                        token_limit_hint = ""
+
+                        if last_finish == "length":
+                            token_limit_hint = (
+                                f"; generation reached its output limit "
+                                f"({completion_tokens}/{context.max_output_tokens} tokens). "
+                                "Consider increasing ARC_RUNTIME_MAX_TOOL_CALL_TOKENS "
+                                "or the request's max_tool_call_tokens for longer tool calls."
+                            )
+
+                        logger.warning(
+                            "%s model=%s finish_reason=%s "
+                            "completion_tokens=%d output_token_limit=%d "
+                            "configured_max_tool_call_tokens=%d stop_sequences=%s%s",
+                            warning,
+                            self.model_name,
+                            last_finish or "unknown",
+                            completion_tokens,
+                            context.max_output_tokens,
+                            self.config.max_tool_call_tokens,
+                            context.stop,
+                            token_limit_hint,
+                        )
+
                     usage = {
                         "prompt_tokens": int(prompt_token_count),
                         "completion_tokens": int(completion_tokens),

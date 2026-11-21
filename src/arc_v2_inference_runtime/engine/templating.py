@@ -19,12 +19,28 @@ _FALLBACK_TEMPLATE = """\
 """
 
 
-def _safe_json_loads(value: str) -> Any:
-    try:
-        return json.loads(value)
-    except (TypeError, json.JSONDecodeError):
+def _safe_json_loads(value: Any) -> dict[str, Any]:
+    """
+    Parse tool arguments and guarantee a dictionary.
+
+    Qwen chat templates use `arguments|items`, which requires
+    a mapping. Malformed or incomplete JSON must not reach Jinja.
+    """
+    if isinstance(value, dict):
         return value
 
+    if not isinstance(value, str) or not value.strip():
+        return {}
+
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+
+    if not isinstance(parsed, dict):
+        return {}
+
+    return parsed
 
 def _raise_exception(message: str) -> None:
     raise jinja2.exceptions.TemplateError(message)
